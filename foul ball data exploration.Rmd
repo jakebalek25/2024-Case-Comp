@@ -1,0 +1,660 @@
+# setwd
+```{r}
+setwd("C:/Users/natey/Documents/R/SAL 358 Work/SABR Case Comp")
+```
+
+# libraries
+```{r, include=FALSE}
+library(tidyverse)
+library(ranger)
+library(caret)
+library(klaR)
+library(ROSE)
+```
+
+# read in data
+```{r}
+game_years <- c(2020:2023)
+
+data <- read.csv("savantpbp_all.csv") %>% 
+  filter(game_type == "R" &
+           game_year %in% game_years)
+
+data %>% 
+  glimpse()
+```
+
+# creating out probabilities
+```{r}
+data %>% 
+  group_by(game_year, game_pk, at_bat_number) %>% # group by at bat
+  mutate(events = ifelse(events == "", NA, events)) %>% 
+  drop_na(events) %>%
+  rename("ab_outcome" = "events") %>% 
+  dplyr::select(ab_outcome) -> ab_events
+
+random_plays <- c("intent_walk", "sac_bunt", "catcher_interf",
+                  "ejection", "sac_bunt_double_play",
+                  "caught_stealing_2b", "caught_stealing_3b",
+                  "caught_stealing_home", "pickoff_1b", "pickoff_2b",
+                  "pickoff_3b", "pickoff_caught_stealing_3b", 
+                  "caught_stealing_home", "wild_pitch", "field_error")
+
+data %>% 
+  left_join(ab_events, 
+            by = c("game_year", "game_pk", "at_bat_number")) %>%
+  drop_na(ab_outcome) %>% 
+  filter(!ab_outcome %in% random_plays) %>% 
+  dplyr::select(ab_outcome, balls, strikes, inning, pitcher, batter,
+         bat_score, fld_score, pitch_number) %>% 
+  mutate(ab_outcome = ifelse(
+    ab_outcome %in% c("single", "double", "triple", "home_run",
+                      "walk", "hit_by_pitch"), "on_base", "out"),
+  count = paste0(balls, "-", strikes)) %>% 
+  group_by(count) %>% # include pitch number?
+  filter(balls < 4 & strikes < 3) %>% 
+  summarise(out_pct = sum(ab_outcome == "out") / n(),
+            n_obs = n()) -> out_probs
+
+out_probs
+```
+
+# add statcast zones
+```{r}
+heart_z <- function(sz_bot,sz_top) {
+  mid <- (sz_bot + sz_top)/2
+  bot <- mid - ((mid - sz_bot)*.67)
+  top <- mid + ((sz_top - mid)*.67)
+  return(c(bot,top))
+}
+
+shadow_z <- function(sz_bot,sz_top) {
+  mid <- (sz_bot + sz_top)/2
+  bot <- sz_bot - ((mid - sz_bot)*.33)
+  top <- sz_top + ((sz_top - mid)*.33)
+  return(c(bot,top))
+}
+
+chase_z <- function(sz_bot,sz_top) {
+  mid <- (sz_bot + sz_top)/2
+  bot <- sz_bot - (mid - sz_bot)
+  top <- sz_top + (sz_top - mid)
+  return(c(bot,top))
+}
+
+heart_x <- 6.7/12
+shadow_x <- 13.3/12
+chase_x <- 20/12
+
+data %>% 
+  drop_na(sz_bot, sz_top, plate_x, plate_z) %>% 
+  mutate(heart_bounds = map2(sz_bot, sz_top, ~heart_z(.x, .y)),
+         shadow_bounds = map2(sz_bot, sz_top, ~shadow_z(.x, .y)),
+         chase_bounds = map2(sz_bot, sz_top, ~chase_z(.x, .y)),
+         statcast_zone = case_when(
+    plate_x < heart_x &
+      plate_x > -heart_x &
+      plate_z < map_dbl(heart_bounds, 2) &
+      plate_z > map_dbl(heart_bounds, 1) ~ "heart",
+    plate_x < shadow_x &
+      plate_x > -shadow_x &
+      plate_z < map_dbl(shadow_bounds, 2) &
+      plate_z > map_dbl(shadow_bounds, 1) ~ "shadow",
+    plate_x < chase_x &
+      plate_x > -chase_x &
+      plate_z < map_dbl(chase_bounds, 2) &
+      plate_z > map_dbl(chase_bounds, 1) ~ "chase",
+    .default = "waste"
+  )) -> data
+```
+
+# rf on hit/no hit
+```{r}
+predictors <- c("release_speed", "plate_x", "plate_z",
+                "pfx_x", "pfx_z", "stand", "statcast_zone",
+                "balls", "strikes")
+
+model_data <- data %>% 
+  filter(game_year %in% 2020:2022 &
+           description == "hit_into_play" &
+           !events %in% c("catcher_interf", "field_error", "sac_bunt",
+                          "sac_bunt_double_play")) %>% 
+  mutate(ab_outcome = ifelse(
+    events %in% c("single", "double", "triple", "home_run"),
+    "on_base", "out") %>% as.factor()
+    ) %>% 
+  dplyr::select(all_of(predictors), ab_outcome) %>% 
+  drop_na()
+
+# oversampling minority class
+oversampled_data <- ovun.sample(
+  ab_outcome ~ .,
+  data = model_data, 
+  method = "over",
+  seed = 1626
+)
+
+model_data <- oversampled_data$data
+
+set.seed(1617)
+index <- sample(nrow(model_data), floor(nrow(model_data) * 0.8)) 
+
+train_data <- model_data %>% 
+  dplyr::slice(index)
+
+test_data <- model_data %>% 
+  dplyr::slice(-index) %>% 
+  dplyr::select(!ab_outcome)
+test_label <- model_data$ab_outcome[-index]
+
+ranger(
+  ab_outcome ~ ., 
+  data = train_data,
+  always.split.variables = c("release_speed", "plate_x", "plate_z",
+                             "pfx_x", "pfx_z"),
+  num.trees = 100,
+  seed = sample(100:999, 1),
+  #probability = T,
+  classification = T,
+  splitrule = "hellinger",
+  importance = "impurity"
+) -> rf_train
+
+rf_train$variable.importance
+
+test_preds <- predict(rf_train, test_data, type = "response")
+
+confusionMatrix(test_preds$predictions, test_label)
+
+# observe probability distribution
+ranger(
+  ab_outcome ~ ., 
+  data = train_data,
+  always.split.variables = c("release_speed", "plate_x", "plate_z",
+                             "pfx_x", "pfx_z"),
+  num.trees = 100,
+  seed = sample(100:999, 1),
+  probability = T,
+  classification = T,
+  splitrule = "hellinger",
+  importance = "impurity"
+) -> rf_train
+
+data.frame(
+  rf_train$predictions
+) %>% 
+  ggplot(aes(x = out)) +
+  geom_histogram()
+
+test_preds <- predict(rf_train, test_data)
+
+data.frame(
+  test_preds$predictions
+) %>% 
+  ggplot(aes(x = out)) +
+  geom_histogram()
+```
+
+# add xba out probabilites to foul data
+```{r}
+data %>% 
+  filter(description == "foul") %>% 
+  drop_na(zone, pitch_name, all_of(predictors)) -> foul_data
+
+xba_out_probs <- predict(rf_train,
+                         foul_data %>% 
+                           dplyr::select(all_of(predictors)))
+
+foul_data %>% 
+  mutate(xba_out_prob = 
+           data.frame(xba_out_probs[["predictions"]])$out) -> foul_data
+
+foul_data %>% 
+  #mutate(hittable = ifelse(statcast_zone %in% c("heart", "shadow"), 1, 0)) %>% 
+  ggplot(aes(x = xba_out_prob)) + 
+  geom_histogram() +
+  facet_wrap(~zone)
+```
+
+# naive bayes foul ball model
+```{r, warning=FALSE}
+model_data <- data %>%
+  filter(description == "foul" | description == "swinging_strike" |
+           description == "swinging_strike_blocked") %>%
+  filter(game_type == "R") %>%
+  arrange(game_pk, at_bat_number, pitch_number) %>%
+  mutate(swing_result = case_when(
+    description == "foul" ~ "foul",
+    description == "swinging_strike" |
+      description == "swinging_strike_blocked" ~ "whiff"),
+    swing_result = as.factor(swing_result),
+    zone = as.factor(zone),
+    pitch_name = as.factor(pitch_name)
+  ) %>%
+  filter(game_year %in% c(2020, 2021, 2022)) %>%
+  dplyr::select(swing_result, balls, strikes, stand,
+                plate_x, plate_z, pfx_x, pfx_z, release_speed) %>%
+  na.omit()
+
+set.seed(453)
+index <- sample(nrow(model_data), floor(nrow(model_data) * 0.8)) 
+train_data <- model_data %>% 
+  dplyr::slice(index) %>% 
+  dplyr::select(!swing_result)
+train_label <- model_data$swing_result[index]
+
+test_data <- model_data %>% 
+  dplyr::slice(-index) %>% 
+  dplyr::select(!swing_result)
+test_label <- model_data$swing_result[-index]
+
+nb_model <- train(train_data, train_label, 'nb', 
+                  trControl = trainControl(method = 'cv', 
+                                           number = 10))
+
+preds <- predict(nb_model$finalModel, test_data)
+
+conf <- confusionMatrix(data = preds$class, 
+                        reference = test_label)
+conf
+
+foul_data %>% 
+  dplyr::select(balls, strikes, stand,
+         plate_x, plate_z, pfx_x, pfx_z, release_speed) -> foul_probs
+
+foul_data %>% 
+  mutate(predict(nb_model, foul_probs, type = "prob")) -> foul_data
+
+foul_data %>% 
+  #mutate(hittable = ifelse(statcast_zone %in% c("heart", "shadow"), 1, 0)) %>% 
+  ggplot(aes(x = foul)) + 
+  geom_histogram()
+```
+
+# foul ball probs
+```{r}
+foul_data %>% 
+  ggplot(aes(x = plate_x, y = plate_z, color = foul)) +
+  geom_point()
+```
+
+# algorithm for determining delta out prob on foul ball #
+
+# hitters
+```{r}
+foul_data %>% 
+  filter(game_year == 2023 &
+           balls %in% 0:3 &
+           strikes %in% 0:2) %>% 
+  mutate(
+    hittable = ifelse(statcast_zone %in% c("heart", "shadow"), 1, 0),
+    
+    ### Out prob added by Count ###
+    
+    out_prob_added = case_when(
+      balls == "0" & strikes == "0" & # 0-0 count out of the zone
+        hittable == 0 ~ out_probs %>% 
+        filter(count == "0-1") %>% 
+        pull(out_pct) - out_probs %>% 
+        filter(count == "1-0") %>% 
+        pull(out_pct),
+      balls == "1" & strikes == "0" & # 1-0 count out of the zone
+        hittable == 0 ~ out_probs %>% 
+        filter(count == "1-1") %>% 
+        pull(out_pct) - out_probs %>% 
+        filter(count == "2-0") %>% 
+        pull(out_pct),
+      balls == "0" & strikes == "1" & # 0-1 count out of the zone
+        hittable == 0 ~ out_probs %>% 
+        filter(count == "0-2") %>% 
+        pull(out_pct) - out_probs %>% 
+        filter(count == "1-1") %>% 
+        pull(out_pct),
+      balls == "2" & strikes == "0" & # 2-0 count out of the zone
+        hittable == 0 ~ out_probs %>% 
+        filter(count == "2-1") %>% 
+        pull(out_pct) - out_probs %>% 
+        filter(count == "3-0") %>% 
+        pull(out_pct),
+      balls == "1" & strikes == "1" & # 1-1 count out of the zone
+        hittable == 0 ~ out_probs %>% 
+        filter(count == "1-2") %>% 
+        pull(out_pct) - out_probs %>% 
+        filter(count == "2-1") %>% 
+        pull(out_pct),
+      balls == "0" & strikes == "2" & # 0-2 count out of the zone
+        hittable == 0 ~ out_probs %>% 
+        filter(count == "0-2") %>% 
+        pull(out_pct) - out_probs %>% 
+        filter(count == "1-2") %>% 
+        pull(out_pct),
+      balls == "3" & strikes == "0" & # 3-0 count out of the zone
+        hittable == 0 ~ out_probs %>% 
+        filter(count == "3-1") %>% 
+        pull(out_pct),
+      balls == "2" & strikes == "1" & # 2-1 count out of the zone
+        hittable == 0 ~ out_probs %>% 
+        filter(count == "2-2") %>% 
+        pull(out_pct) - out_probs %>% 
+        filter(count == "3-1") %>% 
+        pull(out_pct),
+      balls == "1" & strikes == "2" & # 1-2 count out of the zone
+        hittable == 0 ~ out_probs %>% 
+        filter(count == "1-2") %>% 
+        pull(out_pct) - out_probs %>% 
+        filter(count == "2-2") %>% 
+        pull(out_pct),
+      balls == "3" & strikes == "1" & # 3-1 count out of the zone
+        hittable == 0 ~ out_probs %>% 
+        filter(count == "3-2") %>% 
+        pull(out_pct),
+      balls == "2" & strikes == "2" & # 2-2 count out of the zone
+        hittable == 0 ~ out_probs %>% 
+        filter(count == "2-2") %>% 
+        pull(out_pct) - out_probs %>% 
+        filter(count == "3-2") %>% 
+        pull(out_pct),
+      balls == "3" & strikes == "2" & # 3-2 count out of the zone
+        hittable == 0 ~ out_probs %>% 
+        filter(count == "3-2") %>% 
+        pull(out_pct),
+      balls == "0" & strikes == "2" & # 0-2 count in the zone
+        hittable == 1 ~ foul - 1,
+      balls == "1" & strikes == "2" & # 1-2 count in the zone
+        hittable == 1 ~ foul - 1,
+      balls == "2" & strikes == "2" & # 2-2 count in the zone
+        hittable == 1 ~ foul - 1,
+      balls == "3" & strikes == "2" & # 3-2 count in the zone
+        hittable == 1 ~ foul - 1,
+      balls == "0" & strikes == "0" & # 0-0 count in the zone
+        hittable == 1 ~ out_probs %>% 
+        filter(count == "0-1") %>% 
+        pull(out_pct) - xba_out_prob,
+      balls == "1" & strikes == "0" & # 1-0 count in the zone
+        hittable == 1 ~ out_probs %>% 
+        filter(count == "1-1") %>% 
+        pull(out_pct) - xba_out_prob,
+      balls == "0" & strikes == "1" & # 0-1 count in the zone
+        hittable == 1 ~ out_probs %>% 
+        filter(count == "0-2") %>% 
+        pull(out_pct) - xba_out_prob,
+      balls == "2" & strikes == "0" & # 2-0 count in the zone
+        hittable == 1 ~ out_probs %>% 
+        filter(count == "2-1") %>% 
+        pull(out_pct) - xba_out_prob,
+      balls == "1" & strikes == "1" & # 1-1 count in the zone
+        hittable == 1 ~ out_probs %>% 
+        filter(count == "1-2") %>% 
+        pull(out_pct) - xba_out_prob,
+      balls == "0" & strikes == "2" & # 0-2 count in the zone
+        hittable == 1 ~ out_probs %>% 
+        filter(count == "0-2") %>% 
+        pull(out_pct) - xba_out_prob,
+      balls == "3" & strikes == "0" & # 3-0 count in the zone
+        hittable == 1 ~ out_probs %>% 
+        filter(count == "3-1") %>% 
+        pull(out_pct) - xba_out_prob,
+      balls == "2" & strikes == "1" & # 2-1 count in the zone
+        hittable == 1 ~ out_probs %>% 
+        filter(count == "2-2") %>% 
+        pull(out_pct) - xba_out_prob,
+      balls == "1" & strikes == "2" & # 1-2 count in the zone
+        hittable == 1 ~ out_probs %>% 
+        filter(count == "1-2") %>% 
+        pull(out_pct) - xba_out_prob,
+      balls == "3" & strikes == "1" & # 3-1 count in the zone
+        hittable == 1 ~ out_probs %>% 
+        filter(count == "3-2") %>% 
+        pull(out_pct) - xba_out_prob,
+      balls == "2" & strikes == "2" & # 2-2 count in the zone
+        hittable == 1 ~ out_probs %>% 
+        filter(count == "2-2") %>% 
+        pull(out_pct) - xba_out_prob,
+      balls == "3" & strikes == "2" & # 3-2 count in the zone
+        hittable == 1 ~ out_probs %>% 
+        filter(count == "3-2") %>% 
+        pull(out_pct) - xba_out_prob,
+      .default = 0
+    )
+  ) %>% 
+  dplyr::select(all_of(predictors), xba_out_prob, batter,
+                foul, hittable, out_prob_added,
+                game_pk, game_date, at_bat_number,
+                pitch_number) -> fopa_hitter_pbp 
+
+fopa_hitter_pbp %>% 
+  group_by(batter) %>% 
+  summarise(fopa = sum(out_prob_added),
+            n_obs = n()) %>% 
+  ungroup() -> fopa_hitter
+```
+
+# pitchers
+```{r}
+foul_data %>% 
+  filter(game_year == 2023 &
+           balls %in% 0:3 &
+           strikes %in% 0:2) %>% 
+  mutate(
+    hittable = ifelse(statcast_zone %in% c("heart", "shadow"), 1, 0),
+    
+    ### Consider doing for 2 strike counts in the zone:
+    ### ifelse(xba_out_prob > whiff, current equation, foul - 1)
+    ### this would imply if intention was to get swing + miss or soft 
+    ### contact
+    
+    out_prob_added = case_when(
+      balls == "0" & strikes == "0" & # 0-0 count out of the zone
+        hittable == 0 ~ out_probs %>% 
+        filter(count == "0-1") %>% 
+        pull(out_pct) - out_probs %>% 
+        filter(count == "1-0") %>% 
+        pull(out_pct),
+      balls == "1" & strikes == "0" & # 1-0 count out of the zone
+        hittable == 0 ~ out_probs %>% 
+        filter(count == "1-1") %>% 
+        pull(out_pct) - out_probs %>% 
+        filter(count == "2-0") %>% 
+        pull(out_pct),
+      balls == "0" & strikes == "1" & # 0-1 count out of the zone
+        hittable == 0 ~ out_probs %>% 
+        filter(count == "0-2") %>% 
+        pull(out_pct) - out_probs %>% 
+        filter(count == "1-1") %>% 
+        pull(out_pct),
+      balls == "2" & strikes == "0" & # 2-0 count out of the zone
+        hittable == 0 ~ out_probs %>% 
+        filter(count == "2-1") %>% 
+        pull(out_pct) - out_probs %>% 
+        filter(count == "3-0") %>% 
+        pull(out_pct),
+      balls == "1" & strikes == "1" & # 1-1 count out of the zone
+        hittable == 0 ~ out_probs %>% 
+        filter(count == "1-2") %>% 
+        pull(out_pct) - out_probs %>% 
+        filter(count == "2-1") %>% 
+        pull(out_pct),
+      balls == "3" & strikes == "0" & # 3-0 count out of the zone
+        hittable == 0 ~ out_probs %>% 
+        filter(count == "3-1") %>% 
+        pull(out_pct),
+      balls == "2" & strikes == "1" & # 2-1 count out of the zone
+        hittable == 0 ~ out_probs %>% 
+        filter(count == "2-2") %>% 
+        pull(out_pct) - out_probs %>% 
+        filter(count == "3-1") %>% 
+        pull(out_pct),
+      balls == "3" & strikes == "1" & # 3-1 count out of the zone
+        hittable == 0 ~ out_probs %>% 
+        filter(count == "3-2") %>% 
+        pull(out_pct),
+      balls == "0" & strikes == "2" & # 0-2 count out of the zone
+        hittable == 0 ~ foul - 1, 
+      balls == "1" & strikes == "2" & # 1-2 count out of the zone
+        hittable == 0 ~ foul - 1, 
+      balls == "2" & strikes == "2" & # 2-2 count out of the zone
+        hittable == 0 ~ foul - 1, 
+      balls == "3" & strikes == "2" & # 3-2 count out of the zone
+        hittable == 0 ~ foul - 1, 
+      balls == "0" & strikes == "0" & # 0-0 count in the zone
+        hittable == 1 ~ out_probs %>% 
+        filter(count == "0-0") %>% 
+        pull(out_pct) - xba_out_prob,
+      balls == "1" & strikes == "0" & # 1-0 count in the zone 
+        hittable == 1 ~ out_probs %>% 
+        filter(count == "1-0") %>% 
+        pull(out_pct) - xba_out_prob,
+      balls == "0" & strikes == "1" & # 0-1 count in the zone
+        hittable == 1 ~ out_probs %>% 
+        filter(count == "0-1") %>% 
+        pull(out_pct) - xba_out_prob,
+      balls == "2" & strikes == "0" & # 2-0 count in the zone
+        hittable == 1 ~ out_probs %>% 
+        filter(count == "2-0") %>% 
+        pull(out_pct) - xba_out_prob,
+      balls == "1" & strikes == "1" & # 1-1 count in the zone
+        hittable == 1 ~ out_probs %>% 
+        filter(count == "1-1") %>% 
+        pull(out_pct) - xba_out_prob,
+      balls == "0" & strikes == "2" & # 0-2 count in the zone
+        hittable == 1 ~ mean(c(out_probs %>% 
+        filter(count == "0-2") %>% 
+        pull(out_pct) - xba_out_prob,
+        whiff - 1)),
+      balls == "3" & strikes == "0" & # 3-0 count in the zone
+        hittable == 1 ~ out_probs %>% 
+        filter(count == "3-0") %>% 
+        pull(out_pct) - xba_out_prob,
+      balls == "2" & strikes == "1" & # 2-1 count in the zone
+        hittable == 1 ~ out_probs %>% 
+        filter(count == "2-1") %>% 
+        pull(out_pct) - xba_out_prob,
+      balls == "1" & strikes == "2" & # 1-2 count in the zone
+        hittable == 1 ~ mean(c(out_probs %>% 
+        filter(count == "1-2") %>% 
+        pull(out_pct) - xba_out_prob,
+        whiff - 1)),
+      balls == "3" & strikes == "1" & # 3-1 count in the zone
+        hittable == 1 ~ out_probs %>% 
+        filter(count == "3-1") %>% 
+        pull(out_pct) - xba_out_prob,
+      balls == "2" & strikes == "2" & # 2-2 count in the zone
+        hittable == 1 ~ mean(c(out_probs %>% 
+        filter(count == "2-2") %>% 
+        pull(out_pct) - xba_out_prob,
+        whiff - 1)),
+      balls == "3" & strikes == "2" & # 3-2 count in the zone
+        hittable == 1 ~ mean(c(out_probs %>% 
+        filter(count == "3-2") %>% 
+        pull(out_pct) - xba_out_prob,
+        whiff - 1)),
+      .default = 0
+    )
+  ) %>% 
+  dplyr::select(all_of(predictors), xba_out_prob, pitcher,
+                foul, hittable, out_prob_added, 
+                game_pk, game_date, at_bat_number,
+                pitch_number) -> fopa_pitcher_pbp
+
+fopa_pitcher_pbp %>% 
+  group_by(pitcher) %>% 
+  summarise(fopa = sum(out_prob_added),
+            n_obs = n()) %>% 
+  ungroup() -> fopa_pitcher
+```
+
+# hitter analysis (chase% and foul balls per pa)
+```{r}
+# savant season level data
+savant <- read.csv("savant_batting_2015-2023.csv") %>% 
+  filter(year == 2023)
+
+# batter WPA
+data %>% 
+  filter(game_year == 2023) %>% 
+  drop_na(delta_home_win_exp) %>% 
+  mutate(wpa = ifelse(inning_topbot == "Top",
+                      delta_home_win_exp * -1,
+                      delta_home_win_exp)) %>% 
+  group_by(batter) %>% 
+  summarise(hitter_wpa = sum(wpa),
+            n_obs_wpa = n()) %>% 
+  ungroup() -> hitter_wpa
+
+hitter_features <- c("oz_contact_percent", "oz_swing_percent", "pa",
+                     "swing_percent")
+
+savant %>% 
+  dplyr::select(player_id, all_of(hitter_features)) %>% 
+  left_join(fopa_hitter, by = c("player_id" = "batter")) %>% 
+  left_join(hitter_wpa, by = c("player_id" = "batter")) %>% 
+  mutate(fopa_per_pa = fopa / pa,
+         fopa_per_fb = fopa / n_obs,
+         fb_per_pa = n_obs / pa) %>% 
+  filter(n_obs > 300) %>% 
+  # stats to compare to:
+  # hitter_wpa, oz_contact_percent (or swing), fb_per_pa, total_foul_pct
+  ggplot(aes(x = swing_percent, y = fopa, color = n_obs)) +
+  geom_point() +
+  geom_smooth(method = "lm")
+```
+
+# pitcher analysis (bb%)
+```{r, warning=FALSE}
+# savant season level data
+savant <- read.csv("savant_pitching_2015-2023.csv") %>% 
+  filter(year == 2023)
+
+# pitcher WPA
+data %>% 
+  filter(game_year == 2023) %>% 
+  drop_na(delta_home_win_exp) %>% 
+  mutate(wpa = ifelse(inning_topbot == "Top",
+                      delta_home_win_exp,
+                      delta_home_win_exp * -1)) %>% 
+  group_by(pitcher) %>% 
+  summarise(pitcher_wpa = sum(wpa),
+            n_obs_wpa = n()) %>% 
+  ungroup() -> pitcher_wpa
+
+pitcher_features <- c("bb_percent", "pa")
+
+savant %>% 
+  dplyr::select(player_id, all_of(pitcher_features)) %>% 
+  left_join(fopa_pitcher, by = c("player_id" = "pitcher")) %>% 
+  left_join(pitcher_wpa, by = c("player_id" = "pitcher")) %>% 
+  mutate(fopa_per_pa = fopa / pa,
+         fopa_per_fb = fopa / n_obs,
+         fb_per_pa = n_obs / pa) %>% 
+  filter(n_obs > 300) %>% 
+  # stats to compare to:
+  # hitter_wpa, oz_contact_percent (or swing), fb_per_pa, total_foul_pct
+  ggplot(aes(x = bb_percent, y = fopa, color = n_obs)) +
+  geom_point() +
+  geom_smooth(method = "lm")
+```
+
+# rolling fopa
+```{r}
+fopa_hitter_pbp %>% 
+  filter(batter == 673490) %>% 
+  arrange(desc(game_pk), at_bat_number, pitch_number) %>% 
+  mutate(game_date = as.Date(game_date, "%m/%d/%Y"),
+         row_number = row_number()) %>% 
+  ggplot(aes(x = row_number, y = cumsum(out_prob_added))) +
+  geom_line()
+
+fopa_pitcher_pbp %>% 
+  filter(pitcher == 669923) %>% 
+  arrange(desc(game_pk), at_bat_number, pitch_number) %>% 
+  mutate(game_date = as.Date(game_date, "%m/%d/%Y"),
+         row_number = row_number()) %>% 
+  ggplot(aes(x = row_number, y = cumsum(out_prob_added))) +
+  geom_line()
+```
+
+# write csvs
+```{r}
+write.csv(out_probs, "raw_out_probs.csv")
+write.csv(agg_xwoba, "agg_xwoba.csv")
+```
